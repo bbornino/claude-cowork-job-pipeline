@@ -1,0 +1,51 @@
+# Personal data — your real job search activity, identity, and finances.
+# Never commit these. Each has a .example version checked in instead, showing
+# the expected shape/headers without real content. Copy the .example file,
+# rename it (drop ".example"), and fill in your own data locally.
+
+candidate-profile.md
+settings.md
+company-boards.xlsx
+company-tracker.xlsx
+application-history.xlsx
+
+# Generated at runtime — your actual scrape results, application statuses,
+# and shortlist. Always personal, always regenerable from a clean run.
+seen-postings.xlsx
+job-listings.xlsx
+
+# Ephemeral pipeline state — safe to delete anytime, regenerated each run.
+survivors.json
+handoff_companies.json
+handoff_fit_assessments.json
+phase1_report.json
+phase2_report.json
+run-log.xlsx
+department_discovery_report.txt
+
+# Local cache used by greenhouse_api.py's fetch fallback path. board_cache/
+# is the name actually used on disk by Cowork sessions (confirmed via `dir`
+# on B's machine) - pipeline_cache/ is what the script's own DEFAULT_CACHE_DIR
+# constant defaults to internally. Both ignored so whichever name a given
+# session ends up using is covered.
+board_cache/
+pipeline_cache/
+/tmp/pipeline_cache/
+
+# Local data backups created by backup-data.ps1 - duplicates of the
+# personal files above, never commit these either.
+backup/
+
+# Cowork's working-copy directory (if ever created alongside the repo
+# instead of in /tmp — shouldn't normally happen, but ignore defensively).
+pipeline_data/
+
+# Standard Python ignores.
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS cruft.
+.DS_Store
+Thumbs.db
