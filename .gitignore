@@ -19,6 +19,7 @@ survivors.json
 handoff_companies.json
 handoff_fit_assessments.json
 phase1_report.json
+board_rotation_state.json
 phase2_report.json
 run-log.xlsx
 department_discovery_report.txt

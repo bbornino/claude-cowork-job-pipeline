@@ -55,6 +55,36 @@ from dateutil.relativedelta import relativedelta
 import greenhouse_api as gh
 
 DATA_DIR = Path(__file__).resolve().parent
+
+_BOARD_ROTATION_FILE = "board_rotation_state.json"
+
+
+def _load_board_rotation_offset():
+    """Returns the index into the Active-board list to START from this run,
+    persisted across runs in board_rotation_state.json. Without this, every
+    run processes the same boards in company-boards.xlsx row order until
+    max_postings_per_run is hit - on a 16-board list where rows 1-6 alone
+    can exceed the cap, boards further down (often the carefully
+    department-filtered PURSUE companies, since WATCH companies with no
+    filter tend to get added/listed first) never get attempted at all,
+    every single run. Starting from a rotating offset means every board
+    gets a turn across enough runs, instead of the same handful winning
+    forever by virtue of row position."""
+    path = DATA_DIR / _BOARD_ROTATION_FILE
+    if not path.exists():
+        return 0
+    try:
+        return json.loads(path.read_text()).get("next_offset", 0)
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+
+def _save_board_rotation_offset(offset, total_boards):
+    if total_boards <= 0:
+        return
+    path = DATA_DIR / _BOARD_ROTATION_FILE
+    path.write_text(json.dumps({"next_offset": offset % total_boards}))
+
 TODAY = date.today()
 
 def _validate_today():
@@ -90,7 +120,9 @@ def load_config():
     cfg = yaml.safe_load(m.group(1))
     required = [
         "max_postings_per_run", "max_new_companies_per_run",
-        "max_fit_assessments_per_run", "review_list_size", "shortlist_company_fit_floor",
+        "max_fit_assessments_per_run", "max_shortlist_per_company", "review_list_size",
+        "max_posting_age_days",
+        "shortlist_company_fit_floor",
         "comp_floor", "comp_target", "comp_unusually_high", "hourly_to_annual",
     ]
     missing = [k for k in required if k not in cfg]
@@ -513,7 +545,7 @@ def task0_sync_applied_status(wb_listings, wb_seen):
 
 
 def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filters, wb_loc_filters,
-                             fetch_fn=None):
+                             wb_tracker=None, fetch_fn=None):
     if fetch_fn is None:
         fetch_fn = gh.fetch_jobs
     ws_src = wb_sources["Source Sites"]
@@ -530,6 +562,25 @@ def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filter
         for _, d in rows_as_dicts(ws_boards)
         if str(d.get("Status")).strip().lower() == "active" and str(d.get("Source")).strip() in enabled_sources
     ]
+
+    # Tier boards so PURSUE companies get priority over WATCH/unvetted ones,
+    # rather than processing strictly in company-boards.xlsx row order. A
+    # handful of unfiltered WATCH boards (no Departments configured, so they
+    # pull every job on the board) can otherwise consume the entire
+    # max_postings_per_run cap before a single PURSUE company - the ones
+    # actually worth pursuing - gets touched, every single run, regardless
+    # of where the rotation offset currently points.
+    if wb_tracker is not None:
+        ws_tracker = wb_tracker["Company Tracker"]
+        pursue_companies = {
+            normalize_company_name(d.get("Company Name")).casefold()
+            for _, d in rows_as_dicts(ws_tracker)
+            if str(d.get("Status")).strip().upper() == "PURSUE"
+        }
+        tier1 = [b for b in boards if normalize_company_name(b[0]).casefold() in pursue_companies]
+        tier2 = [b for b in boards if normalize_company_name(b[0]).casefold() not in pursue_companies]
+    else:
+        tier1, tier2 = boards, []
 
     ws_seen = wb_seen["Seen Postings"]
     ws_needslink = wb_seen["Needs Link"]
@@ -554,15 +605,29 @@ def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filter
 
     max_pull = cfg["max_postings_per_run"]
 
+    # Rotate TIER 1 (PURSUE boards) so they take turns going first across
+    # runs, rather than always starting at row 1 within that tier. Tier 2
+    # (WATCH/unvetted boards) is appended after, unrotated - it only gets
+    # processed with whatever cap budget tier 1 doesn't use, so fairness
+    # within tier 2 matters much less than guaranteeing tier 1 always gets
+    # first crack at the cap. Wraps around at the end of tier 1's list.
+    total_tier1 = len(tier1)
+    offset = _load_board_rotation_offset() % total_tier1 if total_tier1 else 0
+    tier1 = tier1[offset:] + tier1[:offset]
+    boards = tier1 + tier2
+    total_boards = len(boards)
+
     counts = {
         "boards_attempted": 0, "board_errors": [], "fetched": 0,
         "no_url": 0, "already_seen": 0, "new": 0, "location_excluded": 0,
+        "stale_excluded": 0,
         "title_skip": 0, "survivors": 0, "capped": False,
         "unclassified_titles": 0, "unrecognized_locations": 0,
         "fetch_sources": {},  # company_name -> "direct"/"cache"/"none"/"mixed/cache"
     }
     survivors = []
     pulled_total = 0
+    boards_processed = 0
 
     for company_name, source, board_url, dept_ids in boards:
         if pulled_total >= max_pull:
@@ -570,6 +635,7 @@ def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filter
             break
         slug = gh.slug_from_board_url(board_url)
         counts["boards_attempted"] += 1
+        boards_processed += 1
         result = fetch_fn(slug, dept_ids=dept_ids) if dept_ids else fetch_fn(slug)
         # fetch_fn may be gh.fetch_jobs (returns 3-tuple with source) or a
         # test double (returns 2-tuple) - handle both so existing tests
@@ -641,6 +707,34 @@ def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filter
                 by_url[rec["URL"]] = new_r
                 continue
 
+            # Hard age cutoff: postings older than max_posting_age_days never
+            # become survivors, full stop - not a ranking penalty, an actual
+            # exclusion. Without this, a 2-month-old posting could still get
+            # selected for fit assessment (if fresher competition was thin)
+            # and recommended on the Shortlist, which is exactly what
+            # happened with several Figma postings in a real run - the only
+            # staleness handling that existed before this was a mild ranking
+            # penalty in the fit-assessment selection, applied too late and
+            # too gently to prevent that. Missing/unparseable Posted Date is
+            # NOT excluded here (better to show an undated posting than
+            # silently drop real new listings due to a parsing gap) - that
+            # case is instead logged to Needs Link-style visibility via the
+            # Notes field below, so it's not silently treated as either
+            # fresh or stale.
+            posted_date_obj = rec.get("_posted_date_obj")
+            max_age = cfg.get("max_posting_age_days")
+            if max_age is not None and posted_date_obj is not None:
+                age_days = (TODAY - posted_date_obj).days
+                if age_days > max_age:
+                    counts["stale_excluded"] += 1
+                    excl_note = f"Excluded - stale ({age_days}d old, posted {posted_date_obj.isoformat()})"
+                    new_seen_row["Notes"] = f"{notes}; {excl_note}" if notes else excl_note
+                    new_r = append_dict_row(ws_seen, new_seen_row)
+                    if jid:
+                        by_jid[jid] = new_r
+                    by_url[rec["URL"]] = new_r
+                    continue
+
             # Log novel passing location strings (passed via keyword substring
             # but the full raw string hasn't been explicitly catalogued).
             if matched_kw is not None:  # None = Remote, no logging needed
@@ -683,6 +777,13 @@ def task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_title_filter
             survivor["Role Match"] = role_match
             survivors.append(survivor)
 
+    # Only advance the offset by however many TIER 1 boards were consumed -
+    # if the run had enough cap budget to spill into tier 2, that doesn't
+    # mean tier 1 should skip further ahead than it actually progressed.
+    tier1_consumed = min(boards_processed, total_tier1)
+    _save_board_rotation_offset(offset + tier1_consumed, total_tier1)
+    counts["rotation_offset_this_run"] = offset
+    counts["rotation_offset_next_run"] = (offset + tier1_consumed) % total_tier1 if total_tier1 else 0
     return survivors, counts
 
 
@@ -1065,6 +1166,109 @@ def _task4_revisit_pending(cfg, tracker, wb_seen, wb_listings, wb_boards, floor,
 # ---------------------------------------------------------------------------
 # extract-cache CLI command
 # ---------------------------------------------------------------------------
+
+def cmd_extract_cache_batch(argv):
+    """python3 daily_pipeline.py extract-cache-batch <spec1> <spec2> ... [--cache-dir DIR]
+
+    Batch version of extract-cache: processes many board/dept/posting
+    fetch results in ONE call instead of one tool invocation per file. A
+    department-filtered board with N departments needs N separate cache
+    files - Gitlab alone has 6 configured, Reddit 11, MongoDB 13 - so
+    running extract-cache once per file multiplies tool-call overhead for
+    no benefit; this collapses that into a single call.
+
+    Each spec is colon-separated (not space-separated, since slugs/paths
+    won't contain colons):
+      board:<slug>:<input_file>
+      dept:<slug>:<dept_id>:<input_file>
+      posting:<job_id>:<input_file>
+
+    Example:
+      python3 daily_pipeline.py extract-cache-batch \\
+        dept:gitlab:4115236002:gitlab_ai.txt \\
+        dept:gitlab:4135580002:gitlab_arch.txt \\
+        board:cloudflare:cloudflare_jobs.txt
+
+    Prints one summary line per spec, plus a final count, rather than N
+    separate "Wrote X job(s) to ..." outputs to scroll through."""
+    if len(argv) < 1:
+        print(cmd_extract_cache_batch.__doc__)
+        sys.exit(1)
+    override = argv[argv.index("--cache-dir") + 1] if "--cache-dir" in argv else None
+    cdir = gh.cache_dir(override)
+    specs = [a for a in argv if a != "--cache-dir" and a != override]
+
+    results = []
+    for spec in specs:
+        parts = spec.split(":")
+        kind = parts[0] if parts else ""
+        try:
+            if kind == "board":
+                if len(parts) != 3:
+                    results.append(f"SKIPPED (bad board spec, expected board:slug:file): {spec!r}")
+                    continue
+                _, slug, input_path = parts
+                if not Path(input_path).exists():
+                    results.append(f"ERROR ({slug}): file not found: {input_path}")
+                    continue
+                jobs, truncated = gh.extract_jobs_from_raw(Path(input_path).read_text(errors="replace"))
+                out_dir = cdir / "boards"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{slug}.json"
+                out_path.write_text(json.dumps({"jobs": jobs}, indent=2))
+                msg = f"board {slug}: {len(jobs)} job(s)"
+                if truncated:
+                    msg += " (truncated)"
+                results.append(msg)
+
+            elif kind == "dept":
+                if len(parts) != 4:
+                    results.append(f"SKIPPED (bad dept spec, expected dept:slug:dept_id:file): {spec!r}")
+                    continue
+                _, slug, dept_id, input_path = parts
+                if not Path(input_path).exists():
+                    results.append(f"ERROR ({slug} dept {dept_id}): file not found: {input_path}")
+                    continue
+                jobs, err = gh.extract_dept_from_raw(Path(input_path).read_text(errors="replace"))
+                out_dir = cdir / "boards"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{slug}-dept-{dept_id}.json"
+                out_path.write_text(json.dumps({"jobs": jobs}, indent=2))
+                msg = f"dept {slug}/{dept_id}: {len(jobs)} job(s)"
+                if err:
+                    msg += f" ({err})"
+                results.append(msg)
+
+            elif kind == "posting":
+                if len(parts) != 3:
+                    results.append(f"SKIPPED (bad posting spec, expected posting:job_id:file): {spec!r}")
+                    continue
+                _, job_id, input_path = parts
+                if not Path(input_path).exists():
+                    results.append(f"ERROR (posting {job_id}): file not found: {input_path}")
+                    continue
+                obj, status = gh.extract_posting_from_raw(Path(input_path).read_text(errors="replace"))
+                out_dir = cdir / "postings"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{job_id}.json"
+                if status == "ok":
+                    out_path.write_text(json.dumps(obj, indent=2))
+                    results.append(f"posting {job_id}: ok")
+                else:
+                    out_path.write_text(json.dumps({"_status": status}))
+                    results.append(f"posting {job_id}: {status}")
+            else:
+                results.append(f"SKIPPED (unknown kind {kind!r}, expected board/dept/posting): {spec!r}")
+        except Exception as e:
+            results.append(f"ERROR processing {spec!r}: {type(e).__name__}: {e}")
+
+    print(f"Processed {len(specs)} spec(s):")
+    for r in results:
+        print(f"  {r}")
+    error_count = sum(1 for r in results if r.startswith(("ERROR", "SKIPPED")))
+    if error_count:
+        print(f"\n{error_count} of {len(specs)} had issues - see above.")
+
 
 def cmd_extract_cache(argv):
     """python3 daily_pipeline.py extract-cache board <slug> <input_file> [--cache-dir DIR]
@@ -1465,7 +1669,22 @@ def build_review_sheet(cfg, wb_listings):
         candidates.append((sd, fd))
 
     candidates.sort(key=lambda pair: _review_rank_key(pair[0], pair[1]))
-    candidates = candidates[: cfg["review_list_size"]]
+
+    # Cap how many postings per company can appear on the Shortlist at once.
+    # Without this, a company with many open roles (Asana, Figma) can fill
+    # most or all of the list, crowding out other companies' postings even
+    # when they rank similarly well - the Shortlist is meant to show a
+    # spread of options worth pursuing, not an exhaustive per-company dump.
+    per_company_cap = cfg["max_shortlist_per_company"]
+    company_counts: dict = {}
+    capped_candidates = []
+    for sd, fd in candidates:
+        co = normalize_company_name(sd.get("Company Name") or "").casefold()
+        if company_counts.get(co, 0) >= per_company_cap:
+            continue
+        company_counts[co] = company_counts.get(co, 0) + 1
+        capped_candidates.append((sd, fd))
+    candidates = capped_candidates[: cfg["review_list_size"]]
 
     ws_review = wb_listings["Shortlist"]
     for r in range(ws_review.max_row, 1, -1):
@@ -1489,6 +1708,7 @@ def build_review_sheet(cfg, wb_listings):
             "URL": sd.get("URL"),
             "Job ID": sd.get("Job ID"),
             "Date Found": sd.get("Date Found"),
+            "Posted Date": sd.get("Posted Date") or "Not Disclosed",
             "Job Description": sd.get("Job Description") or "",
             "Status": "",
             "Skip Reason": "",
@@ -1496,6 +1716,69 @@ def build_review_sheet(cfg, wb_listings):
         append_dict_row(ws_review, row)
         rows_written.append(row)
     return rows_written
+
+
+def vetting_cost_report(wb_tracker, vetted_companies=None):
+    """Returns a list of {"company": str, "chars": int, "words": int} for
+    rows freshly vetted this run (Date Checked == TODAY, or explicitly
+    listed in vetted_companies if provided).
+
+    This is NOT a token count - daily_pipeline.py has no access to actual
+    token usage, since that's tracked by the Claude API / Cowork's own
+    infrastructure on the model side of the conversation, not in any file
+    or interface this script can see. Character/word count of what
+    actually got WRITTEN to company-tracker.xlsx is a proxy: it can't tell
+    you the exact token cost of a company-vetting-subagent.md run (which
+    also includes the web searches/fetches themselves, not just the final
+    write), but it's a real, measurable signal for "which companies are
+    expensive to vet" and "did the field-trimming actually reduce output."
+    Words are roughly chars/4.5 (rough English average, not exact - good
+    enough to eyeball relative cost between companies and runs, not
+    precise enough to budget against)."""
+    ws_tracker = wb_tracker["Company Tracker"]
+    target_companies = None
+    if vetted_companies is not None:
+        target_companies = {normalize_company_name(c).casefold() for c in vetted_companies}
+
+    report = []
+    for _, d in rows_as_dicts(ws_tracker):
+        name = d.get("Company Name")
+        if target_companies is not None:
+            if normalize_company_name(name).casefold() not in target_companies:
+                continue
+        else:
+            date_checked = _parse_date(d.get("Date Checked"))
+            if date_checked != TODAY:
+                continue
+        chars = sum(len(str(v)) for v in d.values() if v)
+        report.append({"company": name, "chars": chars, "words": round(chars / 4.5)})
+    return report
+
+
+def companies_needing_vetting_despite_dept_setup(wb_boards, wb_tracker):
+    """Returns a list of company names that HAVE department IDs configured
+    in company-boards.xlsx but have NO row at all in company-tracker.xlsx -
+    i.e. department discovery happened (or department IDs were set up some
+    other way) before the company was ever actually vetted PURSUE/WATCH/
+    BLACKLIST. This is the mirror case of companies_needing_department_discovery:
+    that one catches "vetted but not filtered", this one catches "filtered
+    but never vetted" - both are signs the two steps happened out of order,
+    but this one is the more important gap to close, since a board can sit
+    here indefinitely contributing postings without ever having been
+    through the vetting subagent at all."""
+    ws_tracker = wb_tracker["Company Tracker"]
+    tracked_companies = {
+        normalize_company_name(d.get("Company Name")).casefold()
+        for _, d in rows_as_dicts(ws_tracker)
+    }
+    ws_boards = wb_boards["Company Boards"]
+    needs_vetting = []
+    for _, d in rows_as_dicts(ws_boards):
+        name = d.get("Company Name")
+        key = normalize_company_name(name).casefold()
+        if key not in tracked_companies and str(d.get("Departments") or "").strip():
+            needs_vetting.append(name)
+    return needs_vetting
 
 
 def companies_needing_department_discovery(wb_boards, wb_tracker):
@@ -1522,7 +1805,7 @@ def companies_needing_department_discovery(wb_boards, wb_tracker):
     return needs_discovery
 
 
-def print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_discovery=None):
+def print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_discovery=None, needs_vetting_despite_setup=None, wb_tracker=None):
     """The final human-facing summary. Format:
     - Initial retrieval counts
     - New companies vetted → check company-tracker.xlsx
@@ -1546,6 +1829,15 @@ def print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_disc
               f"review verdicts in company-tracker.xlsx:")
         for v in vetted:
             print(f"  - {v['company']}")
+        if wb_tracker is not None:
+            cost_report = vetting_cost_report(wb_tracker, vetted_companies=[v["company"] for v in vetted])
+            if cost_report:
+                total_words = sum(r["words"] for r in cost_report)
+                print(f"  Output size this run (proxy for vetting cost, NOT actual tokens used — "
+                      f"see vetting_cost_report's docstring for why an exact count isn't possible): "
+                      f"~{total_words} words across {len(cost_report)} compan{'y' if len(cost_report) == 1 else 'ies'}")
+                for r in sorted(cost_report, key=lambda x: -x["words"]):
+                    print(f"    - {r['company']}: ~{r['words']} words ({r['chars']} chars)")
     else:
         print("\nNo new companies vetted this run.")
 
@@ -1557,6 +1849,18 @@ def print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_disc
         print(f"  Run discover_departments.py for {'this one' if len(needs_dept_discovery) == 1 else 'these'} "
               f"when convenient, then add the picks to company-boards.xlsx \"Departments\" column. "
               f"Not urgent — the unfiltered pull still works, just less efficiently.")
+
+    if needs_vetting_despite_setup:
+        print(f"\n{len(needs_vetting_despite_setup)} compan{'y' if len(needs_vetting_despite_setup) == 1 else 'ies'} "
+              f"{'has' if len(needs_vetting_despite_setup) == 1 else 'have'} department IDs configured "
+              f"in company-boards.xlsx but {'was' if len(needs_vetting_despite_setup) == 1 else 'were'} "
+              f"never actually vetted (no row in company-tracker.xlsx at all):")
+        for name in needs_vetting_despite_setup:
+            print(f"  - {name}")
+        print(f"  Run company-vetting-subagent.md for {'this one' if len(needs_vetting_despite_setup) == 1 else 'these'} "
+              f"— department filtering was set up before vetting happened, so right now "
+              f"{'it is' if len(needs_vetting_despite_setup) == 1 else 'they are'} sitting in the lower-priority "
+              f"tier alongside WATCH companies despite the filtering work already done.")
 
     unclassified = t1.get("unclassified_titles", 0)
     if unclassified:
@@ -1623,13 +1927,13 @@ def phase1(cfg):
     updated = task0_sync_applied_status(wb_listings, wb_seen)
     print(f"Task 0: {updated} seen-postings row(s) synced to Applied?=Yes")
 
-    survivors, c = task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_titles, wb_loc)
+    survivors, c = task1_pull_dedup_filter(cfg, wb_boards, wb_sources, wb_seen, wb_titles, wb_loc, wb_tracker)
     print(
         f"Task 1: {c['fetched']} fetched ({c['boards_attempted']} boards"
         + (f", {len(c['board_errors'])} errors" if c['board_errors'] else "")
         + f", capped={c['capped']})"
         + f" -> {c['no_url']} to Needs Link, {c['already_seen']} already seen, {c['new']} new"
-        + f" -> {c['location_excluded']} location-excluded, {c['title_skip']} title-SKIP"
+        + f" -> {c['location_excluded']} location-excluded, {c['stale_excluded']} stale-excluded, {c['title_skip']} title-SKIP"
         + f" -> {c['survivors']} survivors"
     )
     src_counts = {}
@@ -1643,6 +1947,10 @@ def phase1(cfg):
                   f"no Cowork web_fetch needed, no truncation risk)")
     for e in c["board_errors"]:
         print(f"  board error - {e}")
+    if "rotation_offset_this_run" in c:
+        print(f"  PURSUE-board rotation: started at PURSUE board #{c['rotation_offset_this_run'] + 1} this run, "
+              f"next run starts at #{c['rotation_offset_next_run'] + 1}"
+              + (" (cap hit before reaching every board - it'll get there over a few runs)" if c["capped"] else ""))
 
     groups = task2_group_by_company(survivors, wb_tracker)
     carried_over = sum(1 for _, cnt in groups if cnt == 0)
@@ -1748,8 +2056,11 @@ def phase2(cfg):
     fit_rank = {"Strong Match": 0, "Solid Contender": 1, "Long Shot": 2, "Hard No": 3}
 
     def _staleness_penalty(d):
-        """Postings open a long time are more likely backfilled/stale - mild
-        penalty, not a hard skip. 0 if Posted Date is missing/unparseable."""
+        """Tiebreaker among postings that already passed the hard
+        max_posting_age_days cutoff in task1 (so this never sees anything
+        older than that cutoff allows) - prefers fresher postings within
+        that window when multiple postings are competing for the same
+        fit-assessment slot. 0 if Posted Date is missing/unparseable."""
         pd = d.get("Posted Date")
         if isinstance(pd, str):
             try:
@@ -1759,9 +2070,9 @@ def phase2(cfg):
         if not isinstance(pd, date):
             return 0
         age_days = (TODAY - pd).days
-        if age_days > 60:
+        if age_days > 2:
             return 2
-        if age_days > 30:
+        if age_days > 1:
             return 1
         return 0
 
@@ -1861,6 +2172,10 @@ if __name__ == "__main__":
         cmd_extract_cache(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) >= 2 and sys.argv[1] == "extract-cache-batch":
+        cmd_extract_cache_batch(sys.argv[2:])
+        sys.exit(0)
+
     if len(sys.argv) >= 2 and sys.argv[1] == "list-departments":
         cmd_list_departments(sys.argv[2:])
         sys.exit(0)
@@ -1924,7 +2239,8 @@ if __name__ == "__main__":
             wb_boards = load_workbook(DATA_DIR / "company-boards.xlsx")
             wb_tracker = load_workbook(DATA_DIR / "company-tracker.xlsx")
             needs_dept_discovery = companies_needing_department_discovery(wb_boards, wb_tracker)
-            print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_discovery)
+            needs_vetting_despite_setup = companies_needing_vetting_despite_dept_setup(wb_boards, wb_tracker)
+            print_run_summary(phase1_report, phase2_report, review_rows, needs_dept_discovery, needs_vetting_despite_setup, wb_tracker)
         else:
             print("\n(phase1_report.json / phase2_report.json not found - run phase1 and phase2 "
                   "first for the full run summary.)")

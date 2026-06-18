@@ -42,6 +42,7 @@ stall a run waiting to fall back.
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -100,26 +101,63 @@ def department_url(slug, dept_id):
 # Direct HTTP attempt (tried first by every fetch_* function below)
 # ---------------------------------------------------------------------------
 
-def _try_direct(url, timeout=5):
+_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+_RETRYABLE_EXCEPTION_NAMES = {
+    "ConnectionError", "Timeout", "ConnectTimeout", "ReadTimeout",
+    "ChunkedEncodingError", "RemoteDisconnected", "ProtocolError",
+}
+
+
+def _try_direct(url, timeout=5, max_retries=3, backoff_base=2):
     """Returns (json_data, error). error is None on success. Never raises -
     every failure mode (network block, timeout, bad JSON, non-200) is
-    captured and returned as a short error string instead."""
+    captured and returned as a short error string instead.
+
+    Retries with exponential backoff (2s, 4s, 8s by default) ONLY on
+    failures that are plausibly transient: connection errors, timeouts, and
+    HTTP 429/500/502/503/504 (rate-limited or server-side hiccup - the kind
+    of thing that resolves itself if you wait a few seconds and try again,
+    same idea as Cowork's own "API is overloaded, retrying" behavior, just
+    for our own direct fetches rather than Cowork's calls to the Claude API,
+    which this module has no visibility into or control over).
+
+    Does NOT retry on permanent failures: 403 (the proxy block we've seen
+    repeatedly), 404 (bad slug), malformed JSON, or missing `requests`.
+    Retrying those would burn time for zero chance of success - exactly the
+    kind of pointless babysitting this is meant to avoid, just inverted."""
     try:
         import requests
     except ImportError:
         return None, "requests not installed"
-    try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"[:300]
-    if resp.status_code != 200:
-        deny = resp.headers.get("x-deny-reason")
-        snippet = (deny or resp.text or "")[:200]
-        return None, f"HTTP {resp.status_code} - {snippet}"
-    try:
-        return resp.json(), None
-    except ValueError as e:
-        return None, f"Invalid JSON: {e}"
+
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception as e:
+            exc_name = type(e).__name__
+            last_err = f"{exc_name}: {e}"[:300]
+            if exc_name in _RETRYABLE_EXCEPTION_NAMES and attempt < max_retries:
+                time.sleep(backoff_base * (2 ** attempt))
+                continue
+            return None, last_err
+
+        if resp.status_code in _TRANSIENT_STATUS_CODES and attempt < max_retries:
+            last_err = f"HTTP {resp.status_code} (transient) - retrying"
+            time.sleep(backoff_base * (2 ** attempt))
+            continue
+
+        if resp.status_code != 200:
+            deny = resp.headers.get("x-deny-reason")
+            snippet = (deny or resp.text or "")[:200]
+            return None, f"HTTP {resp.status_code} - {snippet}"
+
+        try:
+            return resp.json(), None
+        except ValueError as e:
+            return None, f"Invalid JSON: {e}"
+
+    return None, last_err or "max retries exceeded"
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +440,49 @@ def fetch_departments(slug, override_cache_dir=None):
 # ---------------------------------------------------------------------------
 # Normalization: raw Greenhouse job dict -> our internal record shape
 # ---------------------------------------------------------------------------
+
+def process_job(job, company_name, source, location_type_fn, normalize_name_fn, employment_type_fn):
+    """Map a raw Greenhouse job dict to daily_pipeline.py's posting record.
+
+    Takes the location/name/employment-type helpers as arguments rather
+    than importing daily_pipeline (avoids a circular import - this module
+    is meant to be importable standalone, and daily_pipeline imports it).
+
+    Greenhouse's job-list payload (?content=false) includes a `departments`
+    array per job - independent of whether department-ID filtering is
+    configured on the board, captured either way so it's visible downstream
+    (seen-postings, All Listings, Shortlist), not just used as a filter."""
+    jid = job.get("id")
+    jid = str(jid) if jid is not None else None
+    title = job.get("title") or "Not Disclosed"
+    url = job.get("absolute_url")
+    loc_raw = (job.get("location") or {}).get("name") or ""
+    updated_at = job.get("updated_at")
+    posted_date_obj = None
+    posted_date = "Not Disclosed"
+    if updated_at:
+        try:
+            posted_date_obj = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00")).date()
+            posted_date = posted_date_obj
+        except Exception:
+            pass
+    depts = job.get("departments") or []
+    dept_name = ", ".join(d.get("name", "") for d in depts if d.get("name")) or "Not Disclosed"
+    return {
+        "Job Title": title,
+        "Company Name": normalize_name_fn(company_name),
+        "Source": source,
+        "Department": dept_name,
+        "Location": loc_raw or "Not Disclosed",
+        "Location Type": location_type_fn(loc_raw),
+        "Posted Date": posted_date,
+        "Pay Range": "Not Disclosed",  # not exposed by ?content=false
+        "Employment Type": employment_type_fn(title),
+        "URL": url,
+        "Job ID": jid,
+        "_posted_date_obj": posted_date_obj,
+    }
+
 
 def derive_departments_from_jobs(jobs):
     """Extract a department ID -> {name, job_count} mapping directly from a
